@@ -3,10 +3,10 @@
  * ============================================================
  * Programa puramente secuencial en C++17 para Linux
  *
- * Tarea A: Genera imagen 8K (7580x4320) del conjunto de Mandelbrot
+ * Tarea A: Genera imagen 16K (15360x8640) del conjunto de Mandelbrot
  *          con coloración suavizada (smooth coloring).
  *
- * Tarea B: Aplica filtro Gaussiano separable (radio=11, kernel 55x55)
+ * Tarea B: Aplica filtro Gaussiano separable (radio=63, kernel 127x127)
  *          y filtro Sobel de detección de bordes.
  */
 
@@ -389,13 +389,13 @@ static Image sobelFilter(const ImageF& src) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main() {
     std::cout << "============================================\n"
-              << "  Mandelbrot 4K + Filtros  (secuencial)\n"
+              << "  Mandelbrot 16K + Filtros  (secuencial)\n"
               << "============================================\n";
     auto T0 = Clock::now();
 
     // ── Tarea A ──────────────────────────────────────────────────────────────
     Image fractal = renderMandelbrot();
-    savePNG("mandelbrot_4k.png", fractal, IMG_W, IMG_H);
+    savePNG("mandelbrot_16k.png", fractal, IMG_W, IMG_H);
 
     // ── Tarea B ──────────────────────────────────────────────────────────────
     std::cout << "\n[Tarea B] Gaussiano separable (radio=" << GAUSS_RADIUS
@@ -410,10 +410,10 @@ int main() {
     convV(tmp,  blurF, k1d, GAUSS_RADIUS);
 
     Image blurred = toUint8(blurF);
-    savePNG("mandelbrot_4k_blur.png", blurred, IMG_W, IMG_H);
+    savePNG("mandelbrot_16k_blur.png", blurred, IMG_W, IMG_H);
 
     Image sobel = sobelFilter(blurF);
-    savePNG("mandelbrot_4k_sobel.png", sobel, IMG_W, IMG_H);
+    savePNG("mandelbrot_16k_sobel.png", sobel, IMG_W, IMG_H);
 
     std::cout << "[Tarea B] Listo en " << elapsed(t1) << " s\n";
 
@@ -422,8 +422,8 @@ int main() {
               << "  TOTAL: " << total << " s  (" << total/60.0 << " min)\n"
               << "============================================\n"
               << "\nArchivos generados:\n"
-              << "  mandelbrot_4k.png        — fractal Mandelbrot\n"
-              << "  mandelbrot_4k_blur.png   — desenfoque Gaussiano\n"
-              << "  mandelbrot_4k_sobel.png  — detección de bordes Sobel\n";
+              << "  mandelbrot_16k.png        — fractal Mandelbrot\n"
+              << "  mandelbrot_16k_blur.png   — desenfoque Gaussiano\n"
+              << "  mandelbrot_16k_sobel.png  — detección de bordes Sobel\n";
     return 0;
 }
