@@ -8,10 +8,6 @@
  *
  * Tarea B: Aplica filtro Gaussiano separable (radio=11, kernel 55x55)
  *          y filtro Sobel de detección de bordes.
- *
- * Tiempo estimado (1 hilo, CPU moderna, -O2):
- *   Tarea A ~15-25 min  |  Tarea B ~8-15 min  |  Total ~20-40 min
- * ============================================================
  */
 
 #include <iostream>
@@ -23,10 +19,9 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
-
 // ─── Parámetros globales ──────────────────────────────────────────────────────
-static constexpr int    IMG_W        = 7680;
-static constexpr int    IMG_H        = 4320;
+static constexpr int    IMG_W        = 15360;
+static constexpr int    IMG_H        = 8640;
 static constexpr int    MAX_ITER     = 4096;   // iteraciones Mandelbrot (mayor detalle y carga)
 
 static constexpr double CENTER_X     = -0.75;
