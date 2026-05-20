@@ -101,6 +101,9 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
+#include <array>
+#include <iomanip>
+#include <numeric>
 #include <omp.h>
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -564,6 +567,139 @@ static Image sobelFilter(const ImageF& src) {
     return out;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// TAREA C — Histograma de colores (exclusión mutua con #pragma omp atomic)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Cuenta cuántos píxeles hay de cada valor (0-255) para cada canal R, G, B.
+// En total son 3 × 256 = 768 contadores de tipo uint64_t.
+//
+// ── ¿Por qué atomic y no critical? ──────────────────────────────────────────
+//
+//  critical  — protege un bloque de código arbitrario con un único mutex
+//              global. Solo un hilo puede ejecutar el bloque a la vez,
+//              independientemente del índice que modifica. Resultado:
+//              serialización completa en cada píxel → rendimiento pésimo.
+//
+//  atomic    — protege UNA operación de lectura-modificación-escritura sobre
+//              UNA dirección de memoria. El hardware lo implementa con una
+//              instrucción atómica (LOCK XADD en x86), sin mutex software.
+//              Distintos hilos pueden incrementar contadores DISTINTOS
+//              simultáneamente sin bloquearse entre sí.
+//
+//  Para un histograma con 256 cubetas por canal la contención real es baja
+//  (los hilos raramente tocan el mismo índice al mismo tiempo), por lo que
+//  atomic es la elección correcta: exclusión garantizada con el mínimo
+//  overhead posible.
+//
+//  Alternativa de alto rendimiento (comentada al final de la función):
+//  histogramas locales por hilo + reducción final — elimina toda contención
+//  pero usa más memoria. Se incluye como referencia educativa.
+//
+struct Histogram {
+    // 256 cubetas por canal — índice = valor del byte (0-255)
+    uint64_t r[256]{};
+    uint64_t g[256]{};
+    uint64_t b[256]{};
+};
+
+static Histogram colorHistogram(const Image& img, int w, int h) {
+    std::cout << "\n[Tarea C] Histograma de colores  ("
+              << static_cast<long long>(w) * h << " píxeles, "
+              << "hilos=" << omp_get_max_threads() << ")\n";
+    auto t0 = Clock::now();
+
+    Histogram hist;   // todos los contadores en 0 (inicialización por defecto)
+    const int total = w * h;
+
+    // ── Implementación con #pragma omp atomic ────────────────────────────────
+    // Cada hilo lee el valor del píxel (lectura privada, sin riesgo) y luego
+    // incrementa el contador compartido de su cubeta con una operación atómica.
+    // No hay mutex: el hardware serializa solo los accesos a la misma dirección.
+    #pragma omp parallel for schedule(static) default(none) \
+            shared(img, hist) firstprivate(total)
+    for (int i = 0; i < total; ++i) {
+        uint8_t rv = img[i].r;
+        uint8_t gv = img[i].g;
+        uint8_t bv = img[i].b;
+
+        #pragma omp atomic
+        hist.r[rv]++;
+
+        #pragma omp atomic
+        hist.g[gv]++;
+
+        #pragma omp atomic
+        hist.b[bv]++;
+    }
+
+    // ── Alternativa: histogramas locales por hilo + reducción (sin atomic) ───
+    // Descomenta este bloque y comenta el de arriba para comparar rendimiento.
+    //
+    // #pragma omp parallel default(none) shared(img, hist) firstprivate(total)
+    // {
+    //     // Cada hilo acumula en su propio histograma local (sin contención)
+    //     uint64_t lr[256]{}, lg[256]{}, lb[256]{};
+    //
+    //     #pragma omp for schedule(static)
+    //     for (int i = 0; i < total; ++i) {
+    //         lr[img[i].r]++;
+    //         lg[img[i].g]++;
+    //         lb[img[i].b]++;
+    //     }
+    //
+    //     // Reducción: un hilo a la vez suma su local al global (critical)
+    //     #pragma omp critical
+    //     {
+    //         for (int v = 0; v < 256; ++v) {
+    //             hist.r[v] += lr[v];
+    //             hist.g[v] += lg[v];
+    //             hist.b[v] += lb[v];
+    //         }
+    //     }
+    // }
+
+    std::cout << "[Tarea C] Histograma listo en " << elapsed(t0) << " s\n";
+    return hist;
+}
+
+// ─── Imprime un resumen compacto del histograma ───────────────────────────────
+// Muestra los 5 valores más frecuentes por canal y estadísticas básicas.
+static void printHistogramSummary(const Histogram& h, const char* label) {
+    std::cout << "\n── Histograma: " << label << " ──────────────────────────────\n";
+
+    auto topN = [](const uint64_t* arr, int n) {
+        // Devuelve los n índices con mayor conteo
+        std::vector<int> idx(256);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + n, idx.end(),
+                          [&](int a, int b){ return arr[a] > arr[b]; });
+        idx.resize(n);
+        return idx;
+    };
+
+    auto printChannel = [&](const uint64_t* arr, const char* name) {
+        uint64_t total = 0, nonzero = 0;
+        for (int i = 0; i < 256; ++i) { total += arr[i]; if (arr[i]) ++nonzero; }
+
+        std::cout << "  Canal " << name
+                  << "  |  cubetas usadas: " << nonzero << "/256"
+                  << "  |  total píxeles: " << total << "\n"
+                  << "  Top-5 valores más frecuentes:\n";
+
+        for (int v : topN(arr, 5)) {
+            double pct = 100.0 * arr[v] / total;
+            std::cout << "    valor=" << std::setw(3) << v
+                      << "  count=" << std::setw(12) << arr[v]
+                      << "  (" << std::fixed << std::setprecision(3) << pct << "%)\n";
+        }
+    };
+
+    printChannel(h.r, "R");
+    printChannel(h.g, "G");
+    printChannel(h.b, "B");
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main() {
     std::cout << "============================================\n"
@@ -576,6 +712,10 @@ int main() {
     // ── Tarea A ──────────────────────────────────────────────────────────────
     Image fractal = renderMandelbrot();
     savePNG("mandelbrot_16k.png", fractal, IMG_W, IMG_H);
+
+    // ── Histograma del fractal original ──────────────────────────────────────
+    Histogram hFractal = colorHistogram(fractal, IMG_W, IMG_H);
+    printHistogramSummary(hFractal, "Mandelbrot original");
 
     // ── Tarea B ──────────────────────────────────────────────────────────────
     std::cout << "\n[Tarea B] Gaussiano separable (radio=" << GAUSS_RADIUS
@@ -593,8 +733,16 @@ int main() {
     Image blurred = toUint8(blurF);
     savePNG("mandelbrot_16k_blur.png", blurred, IMG_W, IMG_H);
 
+    // ── Histograma tras el desenfoque Gaussiano ───────────────────────────────
+    Histogram hBlur = colorHistogram(blurred, IMG_W, IMG_H);
+    printHistogramSummary(hBlur, "Gaussiano blur");
+
     Image sobel = sobelFilter(blurF);
     savePNG("mandelbrot_16k_sobel.png", sobel, IMG_W, IMG_H);
+
+    // ── Histograma tras el filtro Sobel ──────────────────────────────────────
+    Histogram hSobel = colorHistogram(sobel, IMG_W, IMG_H);
+    printHistogramSummary(hSobel, "Sobel bordes");
 
     std::cout << "[Tarea B] Listo en " << elapsed(t1) << " s\n";
 
