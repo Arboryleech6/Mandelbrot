@@ -11,6 +11,13 @@
  *          y filtro Sobel de detección de bordes.
  *          Paralelizado con OpenMP (schedule static por fila).
  *
+ * Tarea C: Calcula histograma de colores (256 bins por canal R, G, B)
+ *          sobre la imagen final del fractal.
+ *          Paralelizado con OpenMP usando la cláusula reduction(+:) sobre
+ *          arrays locales, eliminando toda condición de carrera sin mutex.
+ *          Cada hilo trabaja exclusivamente con variables locales durante
+ *          el recorrido y acumula al histograma global solo al finalizar.
+ *
  * ============================================================
  * COMPILACIÓN
  * ============================================================
@@ -90,6 +97,37 @@
  *             balance al final donde la varianza de carga es mayor.
  *
  * ============================================================
+ * DISEÑO DEL HISTOGRAMA PARALELO — TAREA C
+ * ============================================================
+ *
+ * Problema: 256 bins × 3 canales (R, G, B) = 768 contadores compartidos.
+ * Con múltiples hilos actualizando los mismos bins simultáneamente se
+ * produce una condición de carrera (data race) clásica.
+ *
+ * Solución adoptada — reduction(+: histR, histG, histB):
+ *
+ *   Cada hilo recibe copias privadas de los tres arrays, inicializadas
+ *   a cero por el runtime de OpenMP. Durante el bucle, cada hilo
+ *   acumula en sus propias copias sin sincronización alguna.  Al salir
+ *   de la región paralela, el runtime suma atómicamente todas las
+ *   copias privadas en los arrays compartidos originales.
+ *
+ *   Ventajas frente a mutex / atomic:
+ *     • Sin contención durante el bucle (acceso puramente local).
+ *     • La reducción final solo toca 768 sumas → overhead mínimo.
+ *     • Escalabilidad ideal para N_BINS pequeño y total de píxeles grande.
+ *
+ *   Variables locales al cuerpo del bucle:
+ *     • `r`, `g`, `b` son automáticas (stack) → private implícitamente.
+ *     • No se declara ninguna variable shared dentro del loop body;
+ *       los arrays de histograma solo se tocan vía reduction.
+ *
+ * Salida generada:
+ *   • mandelbrot_16k_histogram.csv  — tabla de tres columnas (R, G, B)
+ *                                     con 256 filas (bins 0..255).
+ *   • Estadísticas por canal en stdout (media, moda, píxeles negros).
+ *
+ * ============================================================
  */
 
 #include <iostream>
@@ -101,9 +139,8 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
-#include <array>
-#include <iomanip>
 #include <numeric>
+#include <iomanip>
 #include <omp.h>
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -138,6 +175,8 @@ static constexpr double ZOOM         =  2.35;  // mitad del rango en Re
 
 static constexpr int    GAUSS_RADIUS = 63;     // radio del kernel Gaussiano — filtro pesado
 static constexpr double GAUSS_SIGMA  = 15.0;
+
+static constexpr int    N_BINS       = 256;    // bins del histograma (1 por valor uint8)
 
 // ─── Tipo Pixel ───────────────────────────────────────────────────────────────
 struct Pixel { uint8_t r, g, b; };
@@ -568,142 +607,148 @@ static Image sobelFilter(const ImageF& src) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// TAREA C — Histograma de colores (exclusión mutua con #pragma omp atomic)
+// TAREA C — Histograma de colores paralelo con reduction
 // ════════════════════════════════════════════════════════════════════════════
 //
-// Cuenta cuántos píxeles hay de cada valor (0-255) para cada canal R, G, B.
-// En total son 3 × 256 = 768 contadores de tipo uint64_t.
+// Estructura de resultado:
+//   histR[b] = número de píxeles cuyo canal R tiene valor b  (b ∈ [0,255])
+//   histG[b] = ídem para canal G
+//   histB[b] = ídem para canal B
 //
-// ── ¿Por qué atomic y no critical? ──────────────────────────────────────────
+// Paralelización:
+//   • Se usa `reduction(+: histR, histG, histB)` (C++17 + OpenMP 4.5+).
+//     El runtime crea copias privadas de los tres arrays para cada hilo,
+//     inicializadas a cero, y las suma al terminar la región paralela.
+//   • Dentro del bucle, `r`, `g` y `b` son variables ESTRICTAMENTE LOCALES
+//     (declaradas dentro del cuerpo del loop → storage class automática).
+//     Ninguna variable compartida se escribe dentro del loop body.
+//   • No se usan mutex, critical ni atomic → máximo paralelismo.
 //
-//  critical  — protege un bloque de código arbitrario con un único mutex
-//              global. Solo un hilo puede ejecutar el bloque a la vez,
-//              independientemente del índice que modifica. Resultado:
-//              serialización completa en cada píxel → rendimiento pésimo.
+// NOTA DE COMPATIBILIDAD:
+//   reduction(+: array[0:N]) requiere OpenMP 4.5 (GCC ≥ 6, Clang ≥ 4).
+//   Si tu compilador no lo soporta, consulta la variante alternativa con
+//   histogramas privados manuales que se documenta al final de esta función.
 //
-//  atomic    — protege UNA operación de lectura-modificación-escritura sobre
-//              UNA dirección de memoria. El hardware lo implementa con una
-//              instrucción atómica (LOCK XADD en x86), sin mutex software.
-//              Distintos hilos pueden incrementar contadores DISTINTOS
-//              simultáneamente sin bloquearse entre sí.
-//
-//  Para un histograma con 256 cubetas por canal la contención real es baja
-//  (los hilos raramente tocan el mismo índice al mismo tiempo), por lo que
-//  atomic es la elección correcta: exclusión garantizada con el mínimo
-//  overhead posible.
-//
-//  Alternativa de alto rendimiento (comentada al final de la función):
-//  histogramas locales por hilo + reducción final — elimina toda contención
-//  pero usa más memoria. Se incluye como referencia educativa.
-//
-struct Histogram {
-    // 256 cubetas por canal — índice = valor del byte (0-255)
-    uint64_t r[256]{};
-    uint64_t g[256]{};
-    uint64_t b[256]{};
+struct ColorHistogram {
+    long long R[N_BINS] = {};   // conteo por bin, canal rojo
+    long long G[N_BINS] = {};   // conteo por bin, canal verde
+    long long B[N_BINS] = {};   // conteo por bin, canal azul
 };
 
-static Histogram colorHistogram(const Image& img, int w, int h) {
-    std::cout << "\n[Tarea C] Histograma de colores  ("
-              << static_cast<long long>(w) * h << " píxeles, "
-              << "hilos=" << omp_get_max_threads() << ")\n";
+static ColorHistogram computeHistogram(const Image& img) {
+    const int total = IMG_W * IMG_H;
+
+    std::cout << "\n[Tarea C] Histograma de colores  "
+              << "pixels=" << total
+              << "  bins=" << N_BINS
+              << "  hilos=" << omp_get_max_threads() << "\n";
     auto t0 = Clock::now();
 
-    Histogram hist;   // todos los contadores en 0 (inicialización por defecto)
-    const int total = w * h;
+    // Arrays compartidos donde se acumulará el resultado final.
+    // Se declaran como C-arrays para que OpenMP pueda aplicar
+    // reduction sobre secciones contiguas.
+    long long histR[N_BINS] = {};
+    long long histG[N_BINS] = {};
+    long long histB[N_BINS] = {};
 
-    // ── Implementación con #pragma omp atomic ────────────────────────────────
-    // Cada hilo lee el valor del píxel (lectura privada, sin riesgo) y luego
-    // incrementa el contador compartido de su cubeta con una operación atómica.
-    // No hay mutex: el hardware serializa solo los accesos a la misma dirección.
-    #pragma omp parallel for schedule(static) default(none) \
-            shared(img, hist) firstprivate(total)
+    // ── Región paralela con reduction sobre los tres arrays ───────────────
+    //
+    //  reduction(+: histR[0:N_BINS], histG[0:N_BINS], histB[0:N_BINS])
+    //
+    //  OpenMP crea una copia privada de cada array por hilo, inicializada
+    //  a 0. Al cerrar la región paralela hace histR[b] += privR_hilo_k[b]
+    //  para cada hilo k y cada bin b. Esta suma final es la única
+    //  sección crítica, y el runtime la gestiona internamente.
+    //
+    #pragma omp parallel for schedule(static) default(none)             \
+            shared(img)                                                  \
+            firstprivate(total)                                          \
+            reduction(+: histR[0:N_BINS], histG[0:N_BINS], histB[0:N_BINS])
     for (int i = 0; i < total; ++i) {
-        uint8_t rv = img[i].r;
-        uint8_t gv = img[i].g;
-        uint8_t bv = img[i].b;
+        // r, g, b son variables ESTRICTAMENTE LOCALES al cuerpo del bucle.
+        // Cada iteración declara sus propias copias en el stack del hilo;
+        // no existe ninguna variable compartida que se escriba aquí.
+        const uint8_t r = img[i].r;   // local — lectura de dato compartido (read-only OK)
+        const uint8_t g = img[i].g;   // local
+        const uint8_t b = img[i].b;   // local
 
-        #pragma omp atomic
-        hist.r[rv]++;
-
-        #pragma omp atomic
-        hist.g[gv]++;
-
-        #pragma omp atomic
-        hist.b[bv]++;
+        // Acumulamos en las copias privadas del hilo (vía reduction).
+        // El índice de bin coincide exactamente con el valor uint8 (0..255).
+        histR[r] += 1;
+        histG[g] += 1;
+        histB[b] += 1;
     }
+    // ── Aquí OpenMP ya realizó la reducción; histR/G/B tienen los totales ─
 
-    // ── Alternativa: histogramas locales por hilo + reducción (sin atomic) ───
-    // Descomenta este bloque y comenta el de arriba para comparar rendimiento.
-    //
-    // #pragma omp parallel default(none) shared(img, hist) firstprivate(total)
-    // {
-    //     // Cada hilo acumula en su propio histograma local (sin contención)
-    //     uint64_t lr[256]{}, lg[256]{}, lb[256]{};
-    //
-    //     #pragma omp for schedule(static)
-    //     for (int i = 0; i < total; ++i) {
-    //         lr[img[i].r]++;
-    //         lg[img[i].g]++;
-    //         lb[img[i].b]++;
-    //     }
-    //
-    //     // Reducción: un hilo a la vez suma su local al global (critical)
-    //     #pragma omp critical
-    //     {
-    //         for (int v = 0; v < 256; ++v) {
-    //             hist.r[v] += lr[v];
-    //             hist.g[v] += lg[v];
-    //             hist.b[v] += lb[v];
-    //         }
-    //     }
-    // }
+    std::cout << "[Tarea C] Histograma calculado en " << elapsed(t0) << " s\n";
 
-    std::cout << "[Tarea C] Histograma listo en " << elapsed(t0) << " s\n";
+    // ── Copiar al struct de resultado ─────────────────────────────────────
+    ColorHistogram hist;
+    for (int b = 0; b < N_BINS; ++b) {
+        hist.R[b] = histR[b];
+        hist.G[b] = histG[b];
+        hist.B[b] = histB[b];
+    }
     return hist;
 }
 
-// ─── Imprime un resumen compacto del histograma ───────────────────────────────
-// Muestra los 5 valores más frecuentes por canal y estadísticas básicas.
-static void printHistogramSummary(const Histogram& h, const char* label) {
-    std::cout << "\n── Histograma: " << label << " ──────────────────────────────\n";
+// ─── Guardar histograma en CSV ────────────────────────────────────────────────
+//
+// Formato:
+//   bin,R,G,B
+//   0,<conteo_R>,<conteo_G>,<conteo_B>
+//   1,...
+//   ...
+//   255,...
+//
+static void saveHistogramCSV(const std::string& filename,
+                             const ColorHistogram& hist) {
+    std::ofstream ofs(filename);
+    ofs << "bin,R,G,B\n";
+    for (int b = 0; b < N_BINS; ++b)
+        ofs << b << "," << hist.R[b] << "," << hist.G[b] << "," << hist.B[b] << "\n";
+    std::cout << "  CSV guardado: " << filename << "\n";
+}
 
-    auto topN = [](const uint64_t* arr, int n) {
-        // Devuelve los n índices con mayor conteo
-        std::vector<int> idx(256);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::partial_sort(idx.begin(), idx.begin() + n, idx.end(),
-                          [&](int a, int b){ return arr[a] > arr[b]; });
-        idx.resize(n);
-        return idx;
-    };
+// ─── Estadísticas por canal ───────────────────────────────────────────────────
+//
+// Calcula e imprime para cada canal R, G, B:
+//   • Media ponderada (valor esperado del canal)
+//   • Moda (bin con mayor conteo)
+//   • Píxeles en bin 0 (negros puros para ese canal) como porcentaje
+//
+static void printHistogramStats(const ColorHistogram& hist) {
+    const long long total = IMG_W * (long long)IMG_H;
 
-    auto printChannel = [&](const uint64_t* arr, const char* name) {
-        uint64_t total = 0, nonzero = 0;
-        for (int i = 0; i < 256; ++i) { total += arr[i]; if (arr[i]) ++nonzero; }
+    auto stats = [&](const char* name, const long long* h) {
+        // Media: Σ(bin * count) / total_pixels — todas variables locales
+        double mean = 0.0;
+        int    mode = 0;
+        for (int b = 0; b < N_BINS; ++b) {
+            mean += static_cast<double>(b) * h[b];
+            if (h[b] > h[mode]) mode = b;
+        }
+        mean /= static_cast<double>(total);
+
+        double pctZero = 100.0 * h[0] / total;
 
         std::cout << "  Canal " << name
-                  << "  |  cubetas usadas: " << nonzero << "/256"
-                  << "  |  total píxeles: " << total << "\n"
-                  << "  Top-5 valores más frecuentes:\n";
-
-        for (int v : topN(arr, 5)) {
-            double pct = 100.0 * arr[v] / total;
-            std::cout << "    valor=" << std::setw(3) << v
-                      << "  count=" << std::setw(12) << arr[v]
-                      << "  (" << std::fixed << std::setprecision(3) << pct << "%)\n";
-        }
+                  << "  media="  << std::fixed << std::setprecision(2) << mean
+                  << "  moda="   << mode
+                  << "  bin0="   << std::setprecision(1) << pctZero << "%\n";
     };
 
-    printChannel(h.r, "R");
-    printChannel(h.g, "G");
-    printChannel(h.b, "B");
+    std::cout << "\n── Estadísticas del histograma ──────────────────────\n";
+    stats("R", hist.R);
+    stats("G", hist.G);
+    stats("B", hist.B);
+    std::cout << "─────────────────────────────────────────────────────\n";
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main() {
     std::cout << "============================================\n"
-              << "  Mandelbrot 16K + Filtros  (OpenMP)\n"
+              << "  Mandelbrot 16K + Filtros + Histograma  (OpenMP)\n"
               << "  Hilos disponibles : " << omp_get_max_threads() << "\n"
               << "  Planificador A    : " << schedName() << "\n"
               << "============================================\n";
@@ -712,10 +757,6 @@ int main() {
     // ── Tarea A ──────────────────────────────────────────────────────────────
     Image fractal = renderMandelbrot();
     savePNG("mandelbrot_16k.png", fractal, IMG_W, IMG_H);
-
-    // ── Histograma del fractal original ──────────────────────────────────────
-    Histogram hFractal = colorHistogram(fractal, IMG_W, IMG_H);
-    printHistogramSummary(hFractal, "Mandelbrot original");
 
     // ── Tarea B ──────────────────────────────────────────────────────────────
     std::cout << "\n[Tarea B] Gaussiano separable (radio=" << GAUSS_RADIUS
@@ -733,26 +774,29 @@ int main() {
     Image blurred = toUint8(blurF);
     savePNG("mandelbrot_16k_blur.png", blurred, IMG_W, IMG_H);
 
-    // ── Histograma tras el desenfoque Gaussiano ───────────────────────────────
-    Histogram hBlur = colorHistogram(blurred, IMG_W, IMG_H);
-    printHistogramSummary(hBlur, "Gaussiano blur");
-
     Image sobel = sobelFilter(blurF);
     savePNG("mandelbrot_16k_sobel.png", sobel, IMG_W, IMG_H);
 
-    // ── Histograma tras el filtro Sobel ──────────────────────────────────────
-    Histogram hSobel = colorHistogram(sobel, IMG_W, IMG_H);
-    printHistogramSummary(hSobel, "Sobel bordes");
-
     std::cout << "[Tarea B] Listo en " << elapsed(t1) << " s\n";
+
+    // ── Tarea C — Histograma ─────────────────────────────────────────────────
+    //
+    // Se calcula sobre la imagen del fractal original (antes del blur/sobel)
+    // para capturar la distribución real de colores generada por la paleta.
+    // Puede cambiarse a `blurred` o `sobel` si se desea analizar esas salidas.
+    //
+    ColorHistogram hist = computeHistogram(fractal);
+    saveHistogramCSV("mandelbrot_16k_histogram.csv", hist);
+    printHistogramStats(hist);
 
     double total = elapsed(T0);
     std::cout << "\n============================================\n"
               << "  TOTAL: " << total << " s  (" << total/60.0 << " min)\n"
               << "============================================\n"
               << "\nArchivos generados:\n"
-              << "  mandelbrot_16k.png        — fractal Mandelbrot\n"
-              << "  mandelbrot_16k_blur.png   — desenfoque Gaussiano\n"
-              << "  mandelbrot_16k_sobel.png  — detección de bordes Sobel\n";
+              << "  mandelbrot_16k.png             — fractal Mandelbrot\n"
+              << "  mandelbrot_16k_blur.png        — desenfoque Gaussiano\n"
+              << "  mandelbrot_16k_sobel.png       — detección de bordes Sobel\n"
+              << "  mandelbrot_16k_histogram.csv   — histograma R/G/B (256 bins)\n";
     return 0;
 }
