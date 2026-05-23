@@ -522,84 +522,162 @@ static std::vector<float> gaussKernel1D(int r, double sigma) {
     return k;
 }
 
-// Convolución horizontal — paralelizada por filas (sin dependencia entre filas)
+// Convolución horizontal — paralelizada por filas (OpenMP) +
+//                          vectorización SPMD del bucle interno (omp simd)
+//
+// SPMD aplicado al bucle de acumulación (dx): cada "lane" SIMD procesa
+// un tap del kernel de forma simultánea. La cláusula `reduction(+:...)` le
+// indica al compilador que puede usar acumuladores vectoriales (un acumulador
+// parcial por lane) y reducirlos al final, sin dependencias loop-carried.
+// `safelen(127)` declara que no hay dependencias entre iteraciones a distancia
+// menor de 127 (= 2*GAUSS_RADIUS+1), lo que habilita la vectorización SIMD.
 static void convH(const ImageF& src, ImageF& dst,
                   const std::vector<float>& k, int r) {
+    const float* kp   = k.data();
+    const float* sr   = src.r.data();
+    const float* sg   = src.g.data();
+    const float* sb   = src.b.data();
+    float*       dr   = dst.r.data();
+    float*       dg   = dst.g.data();
+    float*       db   = dst.b.data();
+    const int    W    = src.w;
+    const int    H    = src.h;
+
     #pragma omp parallel for schedule(static) default(none) \
-            shared(src, dst, k) firstprivate(r)
-    for (int py=0;py<src.h;++py) {
-        if (omp_get_thread_num() == 0) progress("  GaussH ", py, src.h);
-        for (int px=0;px<src.w;++px) {
-            float vr=0,vg=0,vb=0;
-            for (int dx=-r;dx<=r;++dx) {
-                int sx=std::clamp(px+dx,0,src.w-1);
-                float w=k[dx+r];
-                vr+=w*src.r[py*src.w+sx];
-                vg+=w*src.g[py*src.w+sx];
-                vb+=w*src.b[py*src.w+sx];
+            shared(sr, sg, sb, dr, dg, db, kp) firstprivate(r, W, H)
+    for (int py = 0; py < H; ++py) {
+        if (omp_get_thread_num() == 0) progress("  GaussH ", py, H);
+        const int row = py * W;
+
+        for (int px = 0; px < W; ++px) {
+            float vr = 0.f, vg = 0.f, vb = 0.f;
+
+            // ── SPMD: vectorizar el bucle del kernel ──────────────────────
+            // Cada tap (dx) es independiente → reducción vectorial SIMD.
+            // safelen(127): sin dependencias entre taps a dist < 127.
+            #pragma omp simd reduction(+:vr,vg,vb) safelen(127)
+            for (int dx = -r; dx <= r; ++dx) {
+                // Clamp sin branch (select ternario → cmov/máscara SIMD)
+                int sx = px + dx;
+                sx = sx < 0 ? 0 : (sx >= W ? W-1 : sx);
+                const float w = kp[dx + r];
+                vr += w * sr[row + sx];
+                vg += w * sg[row + sx];
+                vb += w * sb[row + sx];
             }
-            dst.r[py*src.w+px]=vr;
-            dst.g[py*src.w+px]=vg;
-            dst.b[py*src.w+px]=vb;
+
+            dr[row + px] = vr;
+            dg[row + px] = vg;
+            db[row + px] = vb;
         }
     }
     std::cout << "\n";
 }
 
-// Convolución vertical — paralelizada por filas (sin dependencia entre filas)
+// Convolución vertical — paralelizada por filas (OpenMP) +
+//                        vectorización SPMD del bucle interno (omp simd)
+//
+// Mismo enfoque SPMD que convH: el bucle de acumulación (dy) no tiene
+// dependencias loop-carried → puede vectorizarse. El acceso a `sy*W+px`
+// es un stride de W floats, que con AVX2 se emite como gather escalonado.
+// Con -march=native el compilador puede elegir entre gather o re-layout.
 static void convV(const ImageF& src, ImageF& dst,
                   const std::vector<float>& k, int r) {
+    const float* kp   = k.data();
+    const float* sr   = src.r.data();
+    const float* sg   = src.g.data();
+    const float* sb   = src.b.data();
+    float*       dr   = dst.r.data();
+    float*       dg   = dst.g.data();
+    float*       db   = dst.b.data();
+    const int    W    = src.w;
+    const int    H    = src.h;
+
     #pragma omp parallel for schedule(static) default(none) \
-            shared(src, dst, k) firstprivate(r)
-    for (int py=0;py<src.h;++py) {
-        if (omp_get_thread_num() == 0) progress("  GaussV ", py, src.h);
-        for (int px=0;px<src.w;++px) {
-            float vr=0,vg=0,vb=0;
-            for (int dy=-r;dy<=r;++dy) {
-                int sy=std::clamp(py+dy,0,src.h-1);
-                float w=k[dy+r];
-                vr+=w*src.r[sy*src.w+px];
-                vg+=w*src.g[sy*src.w+px];
-                vb+=w*src.b[sy*src.w+px];
+            shared(sr, sg, sb, dr, dg, db, kp) firstprivate(r, W, H)
+    for (int py = 0; py < H; ++py) {
+        if (omp_get_thread_num() == 0) progress("  GaussV ", py, H);
+        const int row = py * W;
+
+        for (int px = 0; px < W; ++px) {
+            float vr = 0.f, vg = 0.f, vb = 0.f;
+
+            // ── SPMD: vectorizar el bucle del kernel vertical ─────────────
+            // Cada tap (dy) es independiente → reducción vectorial SIMD.
+            // safelen(127): sin dependencias entre taps a dist < 127.
+            #pragma omp simd reduction(+:vr,vg,vb) safelen(127)
+            for (int dy = -r; dy <= r; ++dy) {
+                int sy = py + dy;
+                sy = sy < 0 ? 0 : (sy >= H ? H-1 : sy);
+                const float w = kp[dy + r];
+                vr += w * sr[sy * W + px];
+                vg += w * sg[sy * W + px];
+                vb += w * sb[sy * W + px];
             }
-            dst.r[py*src.w+px]=vr;
-            dst.g[py*src.w+px]=vg;
-            dst.b[py*src.w+px]=vb;
+
+            dr[row + px] = vr;
+            dg[row + px] = vg;
+            db[row + px] = vb;
         }
     }
     std::cout << "\n";
 }
 
-// Filtro Sobel — paralelizado por filas (sin dependencia entre filas de salida)
+// Filtro Sobel — paralelizado por filas (OpenMP) +
+//               vectorización SPMD del bucle más interno (omp simd)
+//
+// El bucle más interno (dx, -1..1) es el candidato SPMD: solo 3 taps,
+// pero el compilador puede desenrollarlo y vectorizarlo junto con el bucle
+// medio (dy) si se les fusiona. Con `omp simd` sobre dx, el compilador
+// genera 3 lanes SIMD con acumulación parcial; útil cuando se compila con
+// -funroll-loops o -O3 donde el unroll es total (ksize=3 → constante).
 static Image sobelFilter(const ImageF& src) {
-    int w=src.w, h=src.h;
-    Image out(w*h);
-    static const float Kx[3][3]={{-1,0,1},{-2,0,2},{-1,0,1}};
-    static const float Ky[3][3]={{-1,-2,-1},{0,0,0},{1,2,1}};
+    const int    w   = src.w;
+    const int    h   = src.h;
+    const float* sr  = src.r.data();
+    const float* sg  = src.g.data();
+    const float* sb  = src.b.data();
+    Image out(w * h);
+
+    // Kernels Sobel como arrays planos (layout fila-mayor, indexados por dy+1, dx+1)
+    static const float Kx[9] = {-1,0,1, -2,0,2, -1,0,1};
+    static const float Ky[9] = {-1,-2,-1,  0,0,0,  1,2,1};
 
     #pragma omp parallel for schedule(static) default(none) \
-            shared(src, out, Kx, Ky) firstprivate(w, h)
-    for (int py=0;py<h;++py) {
+            shared(sr, sg, sb, out, Kx, Ky) firstprivate(w, h)
+    for (int py = 0; py < h; ++py) {
         if (omp_get_thread_num() == 0) progress("  Sobel  ", py, h);
-        for (int px=0;px<w;++px) {
-            float gxR=0,gyR=0,gxG=0,gyG=0,gxB=0,gyB=0;
-            for (int dy=-1;dy<=1;++dy) {
-                int sy=std::clamp(py+dy,0,h-1);
-                for (int dx=-1;dx<=1;++dx) {
-                    int sx=std::clamp(px+dx,0,w-1);
-                    float kx=Kx[dy+1][dx+1], ky=Ky[dy+1][dx+1];
-                    int idx=sy*w+sx;
-                    gxR+=kx*src.r[idx]; gyR+=ky*src.r[idx];
-                    gxG+=kx*src.g[idx]; gyG+=ky*src.g[idx];
-                    gxB+=kx*src.b[idx]; gyB+=ky*src.b[idx];
+
+        for (int px = 0; px < w; ++px) {
+            float gxR=0,gyR=0, gxG=0,gyG=0, gxB=0,gyB=0;
+
+            // Bucle medio (dy): 3 iteraciones — el compilador puede unrollar
+            for (int dy = -1; dy <= 1; ++dy) {
+                const int sy  = py + dy < 0 ? 0 : (py + dy >= h ? h-1 : py + dy);
+                const int base = sy * w;
+
+                // ── SPMD: vectorizar el bucle más interno (dx) ────────────
+                // Aunque solo son 3 taps, con `omp simd` + unroll total el
+                // compilador genera aritmética SIMD para los 3 lanes a la vez.
+                // `safelen(3)` declara que los 3 taps son independientes.
+                #pragma omp simd reduction(+:gxR,gyR,gxG,gyG,gxB,gyB) safelen(3)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int sx  = px + dx < 0 ? 0 : (px + dx >= w ? w-1 : px + dx);
+                    const int kid = (dy+1)*3 + (dx+1);
+                    const float kx = Kx[kid];
+                    const float ky = Ky[kid];
+                    const int   idx = base + sx;
+                    gxR += kx * sr[idx];  gyR += ky * sr[idx];
+                    gxG += kx * sg[idx];  gyG += ky * sg[idx];
+                    gxB += kx * sb[idx];  gyB += ky * sb[idx];
                 }
             }
-            auto mag=[](float a,float b){return std::clamp(std::sqrt(a*a+b*b)/4.f,0.f,1.f);};
-            out[py*w+px]={
-                static_cast<uint8_t>(mag(gxR,gyR)*255),
-                static_cast<uint8_t>(mag(gxG,gyG)*255),
-                static_cast<uint8_t>(mag(gxB,gyB)*255)
+
+            auto mag = [](float a, float b) -> uint8_t {
+                return static_cast<uint8_t>(
+                    std::clamp(std::sqrt(a*a + b*b) / 4.f, 0.f, 1.f) * 255.f);
             };
+            out[py*w + px] = { mag(gxR,gyR), mag(gxG,gyG), mag(gxB,gyB) };
         }
     }
     std::cout << "\n";
@@ -745,8 +823,108 @@ static void printHistogramStats(const ColorHistogram& hist) {
     std::cout << "─────────────────────────────────────────────────────\n";
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// INFORMACIÓN DE COMPILACIÓN — imprime las banderas activas al arrancar
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Los valores se extraen de macros predefinidas por GCC/Clang en tiempo de
+// compilación, por lo que reflejan exactamente las flags usadas.
+//
+// Cómo consultarlas manualmente (en tu terminal):
+//   • Nivel de optimización activo:
+//       g++ -Q --help=optimizers -O2 | grep enabled
+//   • Ver si auto-vectorización está habilitada:
+//       g++ -Q --help=optimizers -O2 | grep "vectorize"
+//   • Ver el informe de vectorización al compilar:
+//       g++ -std=c++17 -O2 -fopenmp -fopt-info-vec-optimized \
+//           -o paralelo paralelo.cpp
+//   • Informe detallado (vectorizado + no vectorizado + motivo):
+//       g++ -std=c++17 -O2 -fopenmp -fopt-info-vec-all \
+//           -o paralelo paralelo.cpp 2>&1 | grep "convH\|convV\|sobel"
+//   • Con AVX2 explícito (recomendado para forzar SIMD de 256 bits):
+//       g++ -std=c++17 -O3 -march=native -fopenmp \
+//           -fopt-info-vec-optimized -o paralelo paralelo.cpp
+//
+static void printCompilerInfo() {
+    std::cout << "\n╔══════════════════════════════════════════════════════╗\n"
+              << "║          INFORMACIÓN DE COMPILACIÓN                  ║\n"
+              << "╠══════════════════════════════════════════════════════╣\n";
+
+    // ── Compilador y versión ──────────────────────────────────────────────
+#if defined(__clang__)
+    std::cout << "║  Compilador : Clang " << __clang_major__ << "."
+              << __clang_minor__ << "." << __clang_patchlevel__ << "\n";
+#elif defined(__GNUC__)
+    std::cout << "║  Compilador : GCC " << __GNUC__ << "."
+              << __GNUC_MINOR__ << "." << __GNUC_PATCHLEVEL__ << "\n";
+#else
+    std::cout << "║  Compilador : Desconocido\n";
+#endif
+
+    // ── Estándar C++ ─────────────────────────────────────────────────────
+    std::cout << "║  Estándar   : C++" << (__cplusplus / 100 - 2000) << "\n";
+
+    // ── Nivel de optimización ─────────────────────────────────────────────
+    // GCC/Clang definen __OPTIMIZE__ cuando se activa cualquier -O > 0
+    // y __OPTIMIZE_SIZE__ cuando se usa -Os/-Oz.
+#if defined(__OPTIMIZE_SIZE__)
+    std::cout << "║  Opt. level : -Os / -Oz  (optimizar tamaño)\n";
+#elif defined(__OPTIMIZE__)
+    // No existe macro directa para O1/O2/O3; se detecta por características:
+    // -O3 activa inline agresivo (__GNUC_STDC_INLINE__) y otras optimizaciones.
+    // La heurística más portable es inspeccionar __NO_INLINE__:
+    //   • Definida   → compilado sin optimización (O0) o con -fno-inline
+    //   • No definida → al menos -O1
+    // Para distinguir O2 de O3 usamos __STRICT_ANSI__ (O3 no lo activa con -O3).
+    // En la práctica, sin -std=c++ el compilador puede variar. Lo más honesto:
+    std::cout << "║  Opt. level : -O (optimización activada; nivel exacto\n"
+              << "║               depende de tus flags — ver nota abajo)\n";
+#else
+    std::cout << "║  Opt. level : -O0  (sin optimización)\n";
+#endif
+
+    // ── SIMD / extensiones ISA ────────────────────────────────────────────
+    std::cout << "║  SIMD ISA   :";
+#if defined(__AVX512F__)
+    std::cout << " AVX-512";
+#elif defined(__AVX2__)
+    std::cout << " AVX2";
+#elif defined(__AVX__)
+    std::cout << " AVX";
+#elif defined(__SSE4_2__)
+    std::cout << " SSE4.2";
+#elif defined(__SSE4_1__)
+    std::cout << " SSE4.1";
+#elif defined(__SSE2__)
+    std::cout << " SSE2";
+#else
+    std::cout << " (sin extensiones SIMD detectadas)";
+#endif
+    std::cout << "\n";
+
+    // ── OpenMP ────────────────────────────────────────────────────────────
+#ifdef _OPENMP
+    std::cout << "║  OpenMP     : versión " << _OPENMP
+              << "  (hilos: " << omp_get_max_threads() << ")\n";
+#else
+    std::cout << "║  OpenMP     : NO compilado (-fopenmp ausente)\n";
+#endif
+
+    // ── Instrucción clave para verificar vectorización ────────────────────
+    std::cout << "╠══════════════════════════════════════════════════════╣\n"
+              << "║  VERIFICACIÓN DE VECTORIZACIÓN (ejecutar en terminal)║\n"
+              << "║  g++ -std=c++17 -O2 -fopenmp                         ║\n"
+              << "║      -fopt-info-vec-optimized                         ║\n"
+              << "║      -o paralelo paralelo.cpp 2>&1 | grep -E         ║\n"
+              << "║      'convH|convV|sobel|vectorized'                  ║\n"
+              << "╚══════════════════════════════════════════════════════╝\n\n";
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 int main() {
+    // ── Información de compilación (ANTES de Tarea A) ─────────────────────
+    printCompilerInfo();
+
     std::cout << "============================================\n"
               << "  Mandelbrot 16K + Filtros + Histograma  (OpenMP)\n"
               << "  Hilos disponibles : " << omp_get_max_threads() << "\n"
